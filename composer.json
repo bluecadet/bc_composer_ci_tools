@@ -1,0 +1,29 @@
+{
+  "name": "bluecadet/bc_composer_ci_tools",
+  "description": "Adds functionality for ci and composer tools built by Bluecadet.",
+  "authors": [
+    {
+      "name": "Pete Inge",
+      "email": "pete.inge@gmail.com",
+      "role": "Maintainer"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/bluecadet/bc_composer_ci_tools/issues"
+  },
+  "license": "GPL-2.0+",
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "require": {
+    "php": "^7.4||^8.0",
+    "squizlabs/php_codesniffer": "3.*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Bluecadet\\PHPCS\\": "src/PHPCS"
+    }
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
