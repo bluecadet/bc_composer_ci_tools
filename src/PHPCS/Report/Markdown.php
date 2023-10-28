@@ -1,6 +1,6 @@
 <?php
 
-namespace Bluecadet\PHPCS\Reoport;
+namespace Bluecadet\PHPCS\Report;
 
 use PHP_CodeSniffer\Files\File;
 use PHP_CodeSniffer\Reports\Report;
