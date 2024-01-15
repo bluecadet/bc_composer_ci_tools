@@ -5,7 +5,7 @@ namespace Bluecadet\PHPCS\Report;
 use PHP_CodeSniffer\Files\File;
 use PHP_CodeSniffer\Reports\Report;
 
-class Markdown implements MarkdownBase {
+class Markdown extends MarkdownBase {
 
   /**
    * {@inheritdoc}
