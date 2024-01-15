@@ -47,10 +47,10 @@ class MarkdownBase implements Report {
       if ($report['warnings'] > 0) {
         echo $report['warnings'] . " WARNINGS ";
       }
-      echo "".PHP_EOL;
+      echo "" . PHP_EOL;
 
 
-      echo "".PHP_EOL;
+      echo "" . PHP_EOL;
       echo "| Line # | Type | Severity | FIX | Message |" . PHP_EOL;
       echo "| -----: | :--: | :------: | :-: | :------ |" . PHP_EOL;
 
@@ -70,9 +70,9 @@ class MarkdownBase implements Report {
       }
 
 
-      echo "".PHP_EOL;
+      echo "" . PHP_EOL;
       echo "<br><br>".PHP_EOL;
-      echo "".PHP_EOL;
+      echo "" . PHP_EOL;
 
       return TRUE;
     }
@@ -137,16 +137,18 @@ class MarkdownBase implements Report {
         echo $this->formatTextColor($d[1], 'red');
         echo " | ";
         // echo $this->colors ? "<span style=\"color: yellow\">" . $d[2] . "</span>" : $d[2];
-        echo $this->formatTextColor($d[2], 'red');
+        echo $this->formatTextColor($d[2], 'yellow');
         echo " |" . PHP_EOL;
       }
 
       echo "" . PHP_EOL;
 
-      echo "A TOTAL OF " . $totalErrors . " ERROR";
-      if ($totalErrors > 1) echo "S";
-      echo " AND " . $totalWarnings . " WARNING";
-      if ($totalWarnings > 1) echo "S";
+      echo "A TOTAL OF " . $totalErrors . " ";
+      if ($totalErrors > 1) $this->formatTextColor("ERRORS", 'red');
+      else $this->formatTextColor("ERROR", 'red');
+      echo " AND " . $totalWarnings . " ";
+      if ($totalWarnings > 1) $this->formatTextColor("WARNINGS", 'yellow');
+      else $this->formatTextColor("WARNING", 'yellow');
       echo " WERE FOUND IN " . $totalFiles . " FILE";
       if ($totalFiles > 1) echo "S";
       echo "<br>";
