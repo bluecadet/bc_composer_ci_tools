@@ -8,6 +8,7 @@ use PHP_CodeSniffer\Reports\Report;
 class MarkdownBase implements Report {
 
     protected $colors = FALSE;
+    protected $config = NULL;
 
     /**
      * Generate a partial report for a single processed file.
@@ -24,6 +25,10 @@ class MarkdownBase implements Report {
      * @return bool
      */
     public function generateFileReport($report, File $phpcsFile, $showSources=false, $width=80) {
+
+      if (empty($this->config)) {
+        $this->config = $phpcsFile->config;
+      }
 
       $this->colors = $colors = $phpcsFile->config->__get('colors');
 
