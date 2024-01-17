@@ -144,19 +144,21 @@ class MarkdownBase implements Report {
       echo "" . PHP_EOL;
 
       echo "A TOTAL OF " . $totalErrors . " ";
-      if ($totalErrors > 1) $this->formatTextColor("ERRORS", 'red');
-      else $this->formatTextColor("ERROR", 'red');
+
+      if ($totalErrors > 1) echo $this->formatTextColor("ERRORS", 'red');
+      else echo $this->formatTextColor("ERROR", 'red');
+
       echo " AND " . $totalWarnings . " ";
-      if ($totalWarnings > 1) $this->formatTextColor("WARNINGS", 'yellow');
-      else $this->formatTextColor("WARNING", 'yellow');
+
+      if ($totalWarnings > 1) echo $this->formatTextColor("WARNINGS", 'yellow');
+      else echo $this->formatTextColor("WARNING", 'yellow');
+
       echo " WERE FOUND IN " . $totalFiles . " FILE";
       if ($totalFiles > 1) echo "S";
       echo "<br>";
 
       echo "TOTAL FIXABLE: " . $totalFixable . PHP_EOL;
       echo "" . PHP_EOL;
-
-
 
       echo "## Details" . PHP_EOL;
       echo "" . PHP_EOL;
