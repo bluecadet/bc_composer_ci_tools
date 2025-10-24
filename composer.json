@@ -26,6 +26,9 @@
   "scripts": {
       "run-phpcs": "Bluecadet\\PhpCsChecksCommand"
   },
+  "bin": [
+    "bin/bc-run-phpcs"
+  ],
   "config": {
     "sort-packages": true
   }
