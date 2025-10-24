@@ -1,0 +1,308 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * bc-run-drupal-check — capture & use drupal-check report data.
+ *
+ * Examples:
+ *   ./bc-run-drupal-check web/modules/custom
+ *   ./bc-run-drupal-check -d web/modules/custom        # deprecations
+ *   ./bc-run-drupal-check -a web/modules/custom        # analysis
+ *   DRUPALCHECK_CSV=dc.csv ./bc-run-drupal-check web/modules/custom
+ *
+ * By default (if no --format is provided) this wrapper injects:
+ *   --format=json --no-progress --no-ansi
+ */
+
+function err(string $m): void { fwrite(STDERR, $m); }
+function is_windows(): bool { return DIRECTORY_SEPARATOR === '\\'; }
+
+/** Find project-local drupal-check */
+function find_local_dc(string $startDir): ?string {
+    $dir = realpath($startDir) ?: $startDir;
+    while ($dir && $dir !== DIRECTORY_SEPARATOR) {
+        foreach ([$dir.'/vendor/bin/drupal-check', $dir.'/vendor/bin/drupal-check.phar'] as $c) {
+            if (file_exists($c)) return $c;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) break;
+        $dir = $parent;
+    }
+    return null;
+}
+
+/** PATH lookup */
+function which(string $cmd): ?string {
+    $paths = array_filter(explode(PATH_SEPARATOR, (string)getenv('PATH')));
+    $exes = is_windows()
+        ? (array_filter(explode(';', (string)getenv('PATHEXT'))) ?: ['.exe','.bat','.cmd','.com'])
+        : [''];
+    foreach ($paths as $p) {
+        $p = rtrim($p, DIRECTORY_SEPARATOR);
+        foreach ($exes as $ext) {
+            $cand = $p.DIRECTORY_SEPARATOR.$cmd.$ext;
+            if (is_file($cand) && is_readable($cand)) return $cand;
+        }
+    }
+    return null;
+}
+
+/** Inspect args for --format and flags that affect stdout noise */
+function analyze_args(array $args): array {
+    $hasFormat = false; $format = null;
+    $hasNoProgress = false; $hasNoAnsi = false;
+
+    foreach ($args as $i => $a) {
+        if (str_starts_with($a, '--format=')) {
+            $hasFormat = true; $format = substr($a, 9);
+        } elseif ($a === '--format' && isset($args[$i+1])) {
+            $hasFormat = true; $format = $args[$i+1];
+        } elseif ($a === '--no-progress') {
+            $hasNoProgress = true;
+        } elseif ($a === '--no-ansi') {
+            $hasNoAnsi = true;
+        }
+    }
+    return [$hasFormat, $format, $hasNoProgress, $hasNoAnsi];
+}
+
+/** Parse json / checkstyle xml / junit xml, normalize to one schema */
+function parse_report(string $payload, ?string $fmtHint): ?array {
+    $hint = $fmtHint ? strtolower($fmtHint) : null;
+    $trim = ltrim($payload);
+
+    // JSON
+    if ($hint === 'json' || ($trim !== '' && $trim[0] === '{')) {
+        $data = json_decode($payload, true);
+        if (is_array($data)) return normalize_dc_json($data);
+    }
+
+    // XML candidates
+    if ($hint === 'checkstyle' || $hint === 'junit' || str_starts_with($trim, '<?xml')) {
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($payload);
+        if ($xml !== false) {
+            // Detect checkstyle vs junit by root element
+            $root = strtolower($xml->getName());
+            if ($hint === 'checkstyle' || $root === 'checkstyle') return normalize_checkstyle_xml($xml);
+            if ($hint === 'junit' || $root === 'testsuite' || $root === 'testsuites') return normalize_junit_xml($xml);
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Normalize Drupal Check JSON (built on PHPStan) to:
+ * [
+ *   'totals' => ['errors'=>int,'file_errors'=>int],
+ *   'files'  => [
+ *     '/path/file.php' => [
+ *       'errors'=>int,
+ *       'messages'=>[
+ *          ['line'=>int|null,'message'=>string,'identifier'=>string|null,'type'=>string|null]
+ *       ]
+ *     ],
+ *   ],
+ *   'errors' => [string, ...]  // non-file errors
+ * ]
+ */
+function normalize_dc_json(array $json): array {
+    // Newer drupal-check emits a PHPStan-like JSON when --format=json is used.
+    $out = [
+        'totals' => [
+            'errors'      => (int)($json['totals']['errors']      ?? 0),
+            'file_errors' => (int)($json['totals']['file_errors'] ?? 0),
+        ],
+        'files'  => [],
+        'errors' => [],
+    ];
+
+    foreach (($json['files'] ?? []) as $file => $info) {
+        $messages = [];
+        foreach (($info['messages'] ?? []) as $m) {
+            $messages[] = [
+                'line'       => isset($m['line']) ? (int)$m['line'] : null,
+                'message'    => (string)($m['message'] ?? ''),
+                'identifier' => isset($m['identifier']) ? (string)$m['identifier'] : null,
+                'type'       => isset($m['type']) ? (string)$m['type'] : null, // e.g., deprecation / analysis
+            ];
+        }
+        $out['files'][$file] = [
+            'errors'   => (int)($info['errors'] ?? 0),
+            'messages' => $messages,
+        ];
+    }
+
+    foreach (($json['errors'] ?? []) as $e) {
+        if (is_string($e)) $out['errors'][] = $e;
+    }
+
+    // Derive if missing
+    if (!$out['totals']['errors'] && !$out['totals']['file_errors']) {
+        $fe = 0; foreach ($out['files'] as $f) $fe += (int)($f['errors'] ?? 0);
+        $out['totals']['file_errors'] = $fe;
+        $out['totals']['errors'] = $fe + count($out['errors']);
+    }
+
+    return $out;
+}
+
+/** Normalize Checkstyle XML */
+function normalize_checkstyle_xml(SimpleXMLElement $xml): array {
+    $out = ['totals'=>['errors'=>0,'file_errors'=>0],'files'=>[],'errors'=>[]];
+    foreach ($xml->file as $file) {
+        $path = (string)$file['name'];
+        $messages = [];
+        foreach ($file->error as $errNode) {
+            $messages[] = [
+                'line'       => isset($errNode['line']) ? (int)$errNode['line'] : null,
+                'message'    => (string)($errNode['message'] ?? ''),
+                'identifier' => (string)($errNode['source'] ?? ''),
+                'type'       => null,
+            ];
+        }
+        $out['files'][$path] = ['errors'=>count($messages), 'messages'=>$messages];
+        $out['totals']['file_errors'] += count($messages);
+    }
+    $out['totals']['errors'] = $out['totals']['file_errors'];
+    return $out;
+}
+
+/** Normalize JUnit XML (map each <failure> as a message) */
+function normalize_junit_xml(SimpleXMLElement $xml): array {
+    $out = ['totals'=>['errors'=>0,'file_errors'=>0],'files'=>[],'errors'=>[]];
+
+    $files = [];
+    $suites = strtolower($xml->getName()) === 'testsuite' ? [$xml] : $xml->testsuite;
+    foreach ($suites as $suite) {
+        foreach ($suite->testcase as $tc) {
+            $file = (string)($tc['file'] ?? '');
+            $line = isset($tc['line']) ? (int)$tc['line'] : null;
+            foreach ($tc->failure as $fail) {
+                $msg = (string)$fail;
+                $id  = (string)($fail['type'] ?? '');
+                $files[$file][] = [
+                    'line'       => $line,
+                    'message'    => $msg,
+                    'identifier' => $id,
+                    'type'       => 'failure',
+                ];
+            }
+        }
+    }
+    foreach ($files as $path => $messages) {
+        $out['files'][$path ?: '(unknown)'] = ['errors'=>count($messages), 'messages'=>$messages];
+        $out['totals']['file_errors'] += count($messages);
+    }
+    $out['totals']['errors'] = $out['totals']['file_errors'];
+    return $out;
+}
+
+/** Your hook for exporting, gating, posting, etc. */
+function handle_report(array $report): void {
+    err(sprintf(
+        "Summary: %d total issues (%d file issues)\n",
+        $report['totals']['errors'],
+        $report['totals']['file_errors']
+    ));
+
+    // Optional CSV export via env var
+    $csvPath = getenv('DRUPALCHECK_CSV');
+    if ($csvPath) {
+        $fh = fopen($csvPath, 'w');
+        if ($fh === false) {
+            err("Could not open CSV for writing: {$csvPath}\n");
+            return;
+        }
+        fputcsv($fh, ['file','line','identifier','message']);
+        foreach ($report['files'] as $file => $info) {
+            foreach ($info['messages'] as $m) {
+                fputcsv($fh, [
+                    $file,
+                    $m['line'],
+                    $m['identifier'] ?? '',
+                    $m['message'],
+                ]);
+            }
+        }
+        fclose($fh);
+        err("Wrote CSV: {$csvPath}\n");
+    }
+
+    // Example gate (comment/uncomment to taste):
+    // if ($report['totals']['errors'] > 0) exit(1);
+}
+
+/* ----------------- main ----------------- */
+
+$script = array_shift($argv);
+$args   = $argv;
+
+$dc = find_local_dc(getcwd()) ?? which('drupal-check');
+if (!$dc) {
+    err("Error: drupal-check not found. Install with Composer or ensure it's on PATH.\n");
+    err("  composer require --dev mglaman/drupal-check\n");
+    exit(127);
+}
+
+[$hasFormat, $format, $hasNoProgress, $hasNoAnsi] = analyze_args($args);
+
+// If no format chosen, inject a machine-readable one for parsing
+if (!$hasFormat) {
+    $args[] = '--format=json';
+    $format = 'json';
+}
+// Keep stdout clean for parsing
+if (!$hasNoProgress) $args[] = '--no-progress';
+if (!$hasNoAnsi)     $args[] = '--no-ansi';
+
+// Build command line
+$parts = [];
+$lower = strtolower($dc);
+$runViaPhp = str_ends_with($lower, '.phar') || str_ends_with($lower, '.php');
+if ($runViaPhp) {
+    $parts[] = escapeshellarg(PHP_BINARY ?: 'php');
+    $parts[] = escapeshellarg($dc);
+} else {
+    $parts[] = escapeshellarg($dc);
+}
+foreach ($args as $a) $parts[] = escapeshellarg($a);
+$cmd = implode(' ', $parts);
+
+if (getenv('DRUPALCHECK_DEBUG') === '1') {
+    err("Running: {$cmd}\n");
+}
+
+// Capture stdout (report), stream stderr
+$descriptors = [
+    0 => STDIN,
+    1 => ['pipe', 'w'],
+    2 => STDERR,
+];
+
+$proc = proc_open($cmd, $descriptors, $pipes);
+if (!is_resource($proc)) {
+    err("Error: failed to start drupal-check.\n");
+    exit(1);
+}
+
+$stdout = stream_get_contents($pipes[1]);
+fclose($pipes[1]);
+$exitCode = proc_close($proc);
+
+// Parse the payload we captured
+$parsed = parse_report($stdout, $format ? strtolower($format) : null);
+
+if (is_array($parsed)) {
+    handle_report($parsed);
+} else {
+    if (!$hasFormat) {
+        err("Note: Expected a machine-readable report but could not parse it. Raw output follows:\n");
+    }
+    if ($stdout !== '') fwrite(STDOUT, $stdout);
+}
+
+// Preserve drupal-check's exit code
+exit($exitCode);

@@ -1,0 +1,298 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * bc-run-phpstan — capture & use PHPStan report data.
+ *
+ * Examples:
+ *   ./bc-run-phpstan analyse src
+ *   PHPSTAN_DEBUG=1 ./bc-run-phpstan analyse --level=max src
+ *   PHPSTAN_CSV=phpstan.csv ./bc-run-phpstan analyse src
+ */
+
+function err(string $m): void { fwrite(STDERR, $m); }
+function is_windows(): bool { return DIRECTORY_SEPARATOR === '\\'; }
+
+function find_local_phpstan(string $startDir): ?string {
+    $dir = realpath($startDir) ?: $startDir;
+    while ($dir && $dir !== DIRECTORY_SEPARATOR) {
+        foreach ([$dir.'/vendor/bin/phpstan', $dir.'/vendor/bin/phpstan.phar'] as $c) {
+            if (file_exists($c)) return $c;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) break;
+        $dir = $parent;
+    }
+    return null;
+}
+
+function which(string $cmd): ?string {
+    $paths = array_filter(explode(PATH_SEPARATOR, (string)getenv('PATH')));
+    $exes = is_windows()
+        ? array_filter(explode(';', (string)getenv('PATHEXT'))) ?: ['.exe','.bat','.cmd','.com']
+        : [''];
+    foreach ($paths as $p) {
+        $p = rtrim($p, DIRECTORY_SEPARATOR);
+        foreach ($exes as $ext) {
+            $cand = $p.DIRECTORY_SEPARATOR.$cmd.$ext;
+            if (is_file($cand) && is_readable($cand)) return $cand;
+        }
+    }
+    return null;
+}
+
+/** Inspect args for --error-format and --output-file (both `=value` and space-split). */
+function analyze_args(array $args): array {
+    $hasFormat = false; $format = null; $outputFile = null;
+    $hasNoProgress = false; $hasNoAnsi = false;
+
+    foreach ($args as $i => $a) {
+        if (str_starts_with($a, '--error-format=')) {
+            $hasFormat = true; $format = substr($a, 15);
+        } elseif ($a === '--error-format' && isset($args[$i+1])) {
+            $hasFormat = true; $format = $args[$i+1];
+        } elseif (str_starts_with($a, '--output-file=')) {
+            $outputFile = substr($a, 14);
+        } elseif ($a === '--output-file' && isset($args[$i+1])) {
+            $outputFile = $args[$i+1];
+        } elseif ($a === '--no-progress') {
+            $hasNoProgress = true;
+        } elseif ($a === '--no-ansi') {
+            $hasNoAnsi = true;
+        }
+    }
+    return [$hasFormat, $format, $outputFile, $hasNoProgress, $hasNoAnsi];
+}
+
+/** Try to parse JSON (preferred) or checkstyle XML; normalize to one schema. */
+function parse_report(string $payload, ?string $fmtHint): ?array {
+    $fmtHint = $fmtHint ? strtolower($fmtHint) : null;
+
+    // Prefer JSON if hinted or looks like JSON
+    if ($fmtHint === 'json' || (strlen($payload) && $payload[0] === '{')) {
+        $data = json_decode($payload, true);
+        if (is_array($data)) return normalize_phpstan_json($data);
+    }
+
+    // Try checkstyle XML if hinted or looks like XML
+    if ($fmtHint === 'checkstyle' || str_starts_with(ltrim($payload), '<?xml')) {
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($payload);
+        if ($xml !== false) return normalize_checkstyle_xml($xml);
+    }
+
+    return null;
+}
+
+/**
+ * Normalize PHPStan JSON to:
+ * [
+ *   'totals' => ['errors'=>int,'file_errors'=>int],
+ *   'files'  => [
+ *      '/path/file.php' => [
+ *          'errors'=>int,
+ *          'messages'=>[
+ *              ['line'=>int|null,'message'=>string,'identifier'=>string|null,'ignorable'=>bool|null,'tip'=>string|null]
+ *          ]
+ *      ],
+ *   ],
+ *   'errors' => [string, ...] # non-file errors
+ * ]
+ *
+ * Compatible with modern PHPStan JSON output.
+ */
+function normalize_phpstan_json(array $json): array {
+    $out = [
+        'totals' => [
+            'errors'      => (int)($json['totals']['errors']      ?? 0),
+            'file_errors' => (int)($json['totals']['file_errors'] ?? 0),
+        ],
+        'files'  => [],
+        'errors' => [],
+    ];
+
+    // File-specific errors
+    foreach (($json['files'] ?? []) as $file => $info) {
+        $messages = [];
+        foreach (($info['messages'] ?? []) as $m) {
+            $messages[] = [
+                'line'       => isset($m['line']) ? (int)$m['line'] : null,
+                'message'    => (string)($m['message'] ?? ''),
+                'identifier' => isset($m['identifier']) ? (string)$m['identifier'] : null, // rule id
+                'ignorable'  => isset($m['ignorable']) ? (bool)$m['ignorable'] : null,
+                'tip'        => isset($m['tip']) ? (string)$m['tip'] : null,
+            ];
+        }
+        $out['files'][$file] = [
+            'errors'   => (int)($info['errors'] ?? 0),
+            'messages' => $messages,
+        ];
+    }
+
+    // Non-file errors (e.g., config issues)
+    foreach (($json['errors'] ?? []) as $e) {
+        if (is_string($e)) $out['errors'][] = $e;
+    }
+
+    // Derive totals if missing
+    if (!$out['totals']['errors'] && !$out['totals']['file_errors']) {
+        $totalFileErrors = 0;
+        foreach ($out['files'] as $f) $totalFileErrors += (int)($f['errors'] ?? 0);
+        $out['totals']['file_errors'] = $totalFileErrors;
+        $out['totals']['errors'] = $totalFileErrors + count($out['errors']);
+    }
+
+    return $out;
+}
+
+/**
+ * Normalize Checkstyle XML (<checkstyle><file name=""><error line="" severity="" message="" source=""/></file>…)
+ * to a structure similar to the JSON one above (identifier = source).
+ */
+function normalize_checkstyle_xml(SimpleXMLElement $xml): array {
+    $out = ['totals'=>['errors'=>0,'file_errors'=>0],'files'=>[],'errors'=>[]];
+
+    foreach ($xml->file as $file) {
+        $path = (string)$file['name'];
+        $messages = [];
+        foreach ($file->error as $errNode) {
+            $messages[] = [
+                'line'       => isset($errNode['line']) ? (int)$errNode['line'] : null,
+                'message'    => (string)($errNode['message'] ?? ''),
+                'identifier' => (string)($errNode['source'] ?? ''),
+                'ignorable'  => null,
+                'tip'        => null,
+            ];
+        }
+        $out['files'][$path] = [
+            'errors'   => count($messages),
+            'messages' => $messages,
+        ];
+        $out['totals']['file_errors'] += count($messages);
+    }
+    $out['totals']['errors'] = $out['totals']['file_errors'];
+    return $out;
+}
+
+/** Your hook: export, enforce thresholds, etc. */
+function handle_report(array $report): void {
+    err(sprintf(
+        "Summary: %d total errors (%d file errors)\n",
+        $report['totals']['errors'],
+        $report['totals']['file_errors']
+    ));
+
+    // Optional CSV export via env var
+    $csvPath = getenv('PHPSTAN_CSV');
+    if ($csvPath) {
+        $fh = fopen($csvPath, 'w');
+        if ($fh === false) {
+            err("Could not open CSV for writing: {$csvPath}\n");
+            return;
+        }
+        fputcsv($fh, ['file','line','identifier','message']);
+        foreach ($report['files'] as $file => $info) {
+            foreach ($info['messages'] as $m) {
+                fputcsv($fh, [
+                    $file,
+                    $m['line'],
+                    $m['identifier'] ?? '',
+                    $m['message'],
+                ]);
+            }
+        }
+        fclose($fh);
+        err("Wrote CSV: {$csvPath}\n");
+    }
+
+    // Example: fail if any errors exist (comment out if not desired)
+    // if ($report['totals']['errors'] > 0) exit(1);
+
+    // You can also post to an API, generate HTML, etc. here.
+}
+
+/* ----------------- main ----------------- */
+
+$script = array_shift($argv);
+$args   = $argv;
+
+$phpstan = find_local_phpstan(getcwd()) ?? which('phpstan');
+if (!$phpstan) {
+    err("Error: phpstan not found. Install with composer or ensure it's on PATH.\n");
+    exit(127);
+}
+
+[$hasFormat, $format, $outputFile, $hasNoProgress, $hasNoAnsi] = analyze_args($args);
+
+// If no error format chosen, inject JSON (and --no-progress to keep stdout clean of bars)
+if (!$hasFormat) {
+    $args[] = '--error-format=json';
+    $format = 'json';
+}
+if (!$hasNoProgress) {
+    $args[] = '--no-progress';
+}
+// Also suppress ANSI if not already (helps parsing in some CI)
+if (!$hasNoAnsi) {
+    $args[] = '--no-ansi';
+}
+
+// Build command
+$parts = [];
+$lower = strtolower($phpstan);
+$runViaPhp = str_ends_with($lower, '.phar') || str_ends_with($lower, '.php');
+if ($runViaPhp) {
+    $parts[] = escapeshellarg(PHP_BINARY ?: 'php');
+    $parts[] = escapeshellarg($phpstan);
+} else {
+    $parts[] = escapeshellarg($phpstan);
+}
+foreach ($args as $a) $parts[] = escapeshellarg($a);
+$cmd = implode(' ', $parts);
+
+if (getenv('PHPSTAN_DEBUG') === '1') {
+    err("Running: {$cmd}\n");
+}
+
+// Capture stdout (report) while streaming stderr
+$descriptors = [
+    0 => STDIN,
+    1 => ['pipe', 'w'],
+    2 => STDERR,
+];
+
+$proc = proc_open($cmd, $descriptors, $pipes);
+if (!is_resource($proc)) {
+    err("Error: failed to start phpstan.\n");
+    exit(1);
+}
+
+$stdout = stream_get_contents($pipes[1]);
+fclose($pipes[1]);
+$exitCode = proc_close($proc);
+
+// Prefer output-file content for parsing if present
+$payload = '';
+if ($outputFile && is_readable($outputFile)) {
+    $payload = file_get_contents($outputFile) ?: '';
+} else {
+    $payload = $stdout;
+}
+
+$fmtHint = $format ? strtolower($format) : null;
+$parsed = parse_report($payload, $fmtHint);
+
+if (is_array($parsed)) {
+    handle_report($parsed);
+} else {
+    if (!$hasFormat) {
+        err("Note: Expected a machine-readable report but could not parse it. Raw output follows:\n");
+    }
+    if ($stdout !== '') {
+        fwrite(STDOUT, $stdout);
+    }
+}
+
+// Preserve phpstan's exit code
+exit($exitCode);

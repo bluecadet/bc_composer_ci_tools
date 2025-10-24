@@ -1,0 +1,305 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * bc-run-phpcs — capture & use PHPCS report data.
+ *
+ * Usage examples:
+ *   ./bc-run-phpcs --standard=PSR12 src/
+ *   PHPCS_DEBUG=1 ./bc-run-phpcs --standard=PSR12 src/
+ *   PHPCS_CSV=phpcs.csv ./bc-run-phpcs           # writes a CSV export
+ *
+ * Behavior:
+ * - If no --report is provided, injects --report=json and parses stdout.
+ * - If --report=json|xml is provided, parses that format (prefers JSON).
+ * - If --report-file=FILE is provided, reads that file to parse (still preserves exit code).
+ * - Everything else passes through untouched.
+ */
+
+function err(string $m): void { fwrite(STDERR, $m); }
+function is_windows(): bool { return DIRECTORY_SEPARATOR === '\\'; }
+
+function find_local_phpcs(string $startDir): ?string {
+    $dir = realpath($startDir) ?: $startDir;
+    while ($dir && $dir !== DIRECTORY_SEPARATOR) {
+        foreach ([$dir.'/vendor/bin/phpcs', $dir.'/vendor/bin/phpcs.phar'] as $c) {
+            if (file_exists($c)) return $c;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) break;
+        $dir = $parent;
+    }
+    return null;
+}
+
+function which(string $cmd): ?string {
+    $paths = array_filter(explode(PATH_SEPARATOR, (string)getenv('PATH')));
+    $exes = is_windows()
+        ? array_filter(explode(';', (string)getenv('PATHEXT'))) ?: ['.exe','.bat','.cmd','.com']
+        : [''];
+    foreach ($paths as $p) {
+        $p = rtrim($p, DIRECTORY_SEPARATOR);
+        foreach ($exes as $ext) {
+            $cand = $p.DIRECTORY_SEPARATOR.$cmd.$ext;
+            if (is_file($cand) && is_readable($cand)) return $cand;
+        }
+    }
+    return null;
+}
+
+/**
+ * Decide whether the user already requested a report and/or report file.
+ */
+function analyze_args(array $args): array {
+    $hasReport = false;
+    $reportValue = null;
+    $reportFile = null;
+
+    foreach ($args as $i => $a) {
+        if (str_starts_with($a, '--report=')) {
+            $hasReport = true;
+            $reportValue = substr($a, 9);
+        } elseif ($a === '--report' && isset($args[$i+1])) {
+            $hasReport = true;
+            $reportValue = $args[$i+1];
+        } elseif (str_starts_with($a, '--report-file=')) {
+            $reportFile = substr($a, 14);
+        } elseif ($a === '--report-file' && isset($args[$i+1])) {
+            $reportFile = $args[$i+1];
+        }
+    }
+    return [$hasReport, $reportValue, $reportFile];
+}
+
+/**
+ * Try to parse JSON (preferred), otherwise XML into a normalized array.
+ */
+function parse_report(string $payload, ?string $reportTypeHint): ?array {
+    // Prefer JSON if hint says json or content looks like JSON.
+    $looksJson = $reportTypeHint === 'json' || (strlen($payload) && $payload[0] === '{');
+    if ($looksJson) {
+        $data = json_decode($payload, true);
+        if (is_array($data)) return normalize_phpcs_json($data);
+    }
+
+    // Try XML if hint says xml or content looks like XML.
+    $looksXml = $reportTypeHint === 'xml' || (str_starts_with(ltrim($payload), '<?xml'));
+    if ($looksXml) {
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($payload);
+        if ($xml !== false) return normalize_phpcs_xml($xml);
+    }
+
+    return null;
+}
+
+/**
+ * Normalize PHPCS JSON (structure varies slightly by version) to a simple schema:
+ * [
+ *   'totals' => ['errors'=>int,'warnings'=>int,'fixable'=>int],
+ *   'files'  => [
+ *      '/path/file.php' => [
+ *          'errors'=>int,'warnings'=>int,
+ *          'messages'=>[
+ *              ['line'=>int,'column'=>int,'type'=>'ERROR'|'WARNING','source'=>'Rule','message'=>'...','fixable'=>bool]
+ *          ]
+ *      ],
+ *   ],
+ * ]
+ */
+function normalize_phpcs_json(array $json): array {
+    $out = [
+        'totals' => [
+            'errors'   => (int)($json['totals']['errors']   ?? 0),
+            'warnings' => (int)($json['totals']['warnings'] ?? 0),
+            'fixable'  => (int)($json['totals']['fixable']  ?? 0),
+        ],
+        'files' => [],
+    ];
+    foreach (($json['files'] ?? []) as $file => $info) {
+        $messages = [];
+        foreach (($info['messages'] ?? []) as $m) {
+            $messages[] = [
+                'line'    => (int)($m['line'] ?? 0),
+                'column'  => (int)($m['column'] ?? 0),
+                'type'    => (string)($m['type'] ?? ''),
+                'source'  => (string)($m['source'] ?? ''),
+                'message' => (string)($m['message'] ?? ''),
+                'fixable' => (bool)($m['fixable'] ?? false),
+            ];
+        }
+        $out['files'][$file] = [
+            'errors'   => (int)($info['errors'] ?? 0),
+            'warnings' => (int)($info['warnings'] ?? 0),
+            'messages' => $messages,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Normalize PHPCS XML to the same schema as above.
+ */
+function normalize_phpcs_xml(SimpleXMLElement $xml): array {
+    $out = [
+        'totals' => ['errors'=>0,'warnings'=>0,'fixable'=>0],
+        'files' => [],
+    ];
+    // Totals are not always present in XML; compute as we go.
+    foreach ($xml->file as $file) {
+        $path = (string)$file['name'];
+        $errors = 0; $warnings = 0; $fixable = 0; $messages = [];
+        foreach ($file->children() as $violation) {
+            $type = strtoupper((string)$violation->getName()) === 'ERROR' ? 'ERROR' : 'WARNING';
+            if ($type === 'ERROR') $errors++; else $warnings++;
+            $isFixable = ((string)$violation['fixable']) === 'true';
+            if ($isFixable) $fixable++;
+            $messages[] = [
+                'line'    => (int)$violation['line'],
+                'column'  => (int)$violation['column'],
+                'type'    => $type,
+                'source'  => (string)$violation['source'],
+                'message' => (string)$violation['message'],
+                'fixable' => $isFixable,
+            ];
+        }
+        $out['files'][$path] = [
+            'errors'=>$errors,'warnings'=>$warnings,'messages'=>$messages,
+        ];
+        $out['totals']['errors'] += $errors;
+        $out['totals']['warnings'] += $warnings;
+        $out['totals']['fixable'] += $fixable;
+    }
+    return $out;
+}
+
+/**
+ * Example hook: do anything you want with the normalized report.
+ * - Keep or remove this block as needed.
+ * - Demonstrates CSV export when PHPCS_CSV=/path/file.csv is set.
+ */
+function handle_report(array $report): void {
+    // Simple summary to STDERR
+    err(sprintf(
+        "Summary: %d errors, %d warnings (%d fixable)\n",
+        $report['totals']['errors'],
+        $report['totals']['warnings'],
+        $report['totals']['fixable']
+    ));
+
+    // Optional CSV export via env var
+    $csvPath = getenv('PHPCS_CSV');
+    if ($csvPath) {
+        $fh = fopen($csvPath, 'w');
+        if ($fh === false) {
+            err("Could not open CSV for writing: {$csvPath}\n");
+            return;
+        }
+        fputcsv($fh, ['file','line','column','type','source','message','fixable']);
+        foreach ($report['files'] as $file => $info) {
+            foreach ($info['messages'] as $m) {
+                fputcsv($fh, [
+                    $file,
+                    $m['line'],
+                    $m['column'],
+                    $m['type'],
+                    $m['source'],
+                    $m['message'],
+                    $m['fixable'] ? '1' : '0',
+                ]);
+            }
+        }
+        fclose($fh);
+        err("Wrote CSV: {$csvPath}\n");
+    }
+
+    // You can add custom thresholds here, e.g.:
+    // if ($report['totals']['errors'] > 0) exit(1);
+}
+
+/* ----------------- main ----------------- */
+
+$argv0 = array_shift($argv); // script name
+$args  = $argv;
+
+// locate phpcs
+$phpcs = find_local_phpcs(getcwd()) ?? which('phpcs');
+if (!$phpcs) {
+    err("Error: phpcs not found. Install with composer or ensure it's on PATH.\n");
+    exit(127);
+}
+
+// analyze args
+[$hasReport, $reportValue, $reportFile] = analyze_args($args);
+
+// if no report chosen, inject JSON
+if (!$hasReport) {
+    $args[] = '--report=json';
+    $reportValue = 'json';
+}
+
+// Build command (escape everything)
+$cmdParts = [];
+// If it's a .phar/.php, run via PHP to be safe
+$lower = strtolower($phpcs);
+$runViaPhp = str_ends_with($lower, '.phar') || str_ends_with($lower, '.php');
+if ($runViaPhp) {
+    $cmdParts[] = escapeshellarg(PHP_BINARY ?: 'php');
+    $cmdParts[] = escapeshellarg($phpcs);
+} else {
+    $cmdParts[] = escapeshellarg($phpcs);
+}
+foreach ($args as $a) $cmdParts[] = escapeshellarg($a);
+$cmd = implode(' ', $cmdParts);
+
+if (getenv('PHPCS_DEBUG') === '1') {
+    err("Running: {$cmd}\n");
+}
+
+// We want to capture stdout (report) while letting stderr stream through.
+$descriptors = [
+    0 => STDIN,
+    1 => ['pipe', 'w'],
+    2 => STDERR,
+];
+
+$proc = proc_open($cmd, $descriptors, $pipes);
+if (!is_resource($proc)) {
+    err("Error: failed to start phpcs.\n");
+    exit(1);
+}
+
+$stdout = stream_get_contents($pipes[1]);
+fclose($pipes[1]);
+$exitCode = proc_close($proc);
+
+// If user directed report to a file, prefer that content for parsing.
+$payload = '';
+if ($reportFile && is_readable($reportFile)) {
+    $payload = file_get_contents($reportFile) ?: '';
+} else {
+    $payload = $stdout;
+}
+
+// Try to parse if we think we have JSON or XML.
+// If user chose a non-structured report (e.g., full, summary), parsing will fail—fine.
+$reportTypeHint = $reportValue ? strtolower((string)$reportValue) : null;
+$parsed = parse_report($payload, $reportTypeHint);
+
+// If parsed, hand it to your hook for custom exporting/logic.
+if (is_array($parsed)) {
+    handle_report($parsed);
+} else {
+    // If not parsed and we injected JSON, let the user know.
+    if (!$hasReport) {
+        err("Note: Expected JSON report but could not parse it. Raw output follows:\n");
+    }
+    // Print raw stdout (so behavior still mirrors phpcs output).
+    if ($stdout !== '') {
+        fwrite(STDOUT, $stdout);
+    }
+}
+
+// Preserve original phpcs exit code.
+exit($exitCode);

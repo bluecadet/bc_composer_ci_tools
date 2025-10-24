@@ -1,0 +1,370 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * bc-run-eslint — capture & use ESLint report data with a PHP wrapper.
+ *
+ * Examples:
+ *   ./bc-run-eslint "src/** /*.js"
+ *   ./bc-run-eslint --ext .ts,.tsx src
+ *   ESLINT_DEBUG=1 ./bc-run-eslint --max-warnings=0 src
+ *   ESLINT_CSV=eslint.csv ./bc-run-eslint src             # CSV export
+ *   ESLINT_PASSTHRU=1 ./bc-run-eslint src                 # also print raw output
+ *
+ * Behavior:
+ * - If no --format/-f is provided, injects: --format json --no-color
+ * - If --output-file/-o is used, parses that file instead of stdout
+ * - Parses JSON (preferred) or Checkstyle/JUnit XML, then calls handle_report()
+ * - Preserves ESLint’s exit code unless you override it in the hook
+ */
+
+function err(string $m): void { fwrite(STDERR, $m); }
+function is_windows(): bool { return DIRECTORY_SEPARATOR === '\\'; }
+
+/** Find local ESLint starting at CWD and walking up. */
+function find_local_eslint(string $startDir): ?string {
+    $dir = realpath($startDir) ?: $startDir;
+    while ($dir && $dir !== DIRECTORY_SEPARATOR) {
+        $candidates = [
+            $dir . '/node_modules/.bin/eslint',
+            $dir . '/node_modules/.bin/eslint.js',
+            $dir . '/node_modules/.bin/eslint.cjs',
+            $dir . '/node_modules/.bin/eslint.mjs',
+        ];
+        foreach ($candidates as $c) {
+            if (file_exists($c)) return $c;
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) break;
+        $dir = $parent;
+    }
+    return null;
+}
+
+/** PATH lookup */
+function which(string $cmd): ?string {
+    $paths = array_filter(explode(PATH_SEPARATOR, (string)getenv('PATH')));
+    $exes  = is_windows()
+        ? (array_filter(explode(';', (string)getenv('PATHEXT'))) ?: ['.EXE','.BAT','.CMD','.COM'])
+        : [''];
+    foreach ($paths as $p) {
+        $p = rtrim($p, DIRECTORY_SEPARATOR);
+        foreach ($exes as $ext) {
+            $cand = $p . DIRECTORY_SEPARATOR . $cmd . $ext;
+            if (is_file($cand) && is_readable($cand)) return $cand;
+        }
+    }
+    return null;
+}
+
+/** Detect if we should run via node (when eslint is a plain .js/.cjs/.mjs file without exec bit). */
+function should_run_via_node(string $eslintPath): bool {
+    $lower = strtolower($eslintPath);
+    if (str_ends_with($lower, '.js') || str_ends_with($lower, '.cjs') || str_ends_with($lower, '.mjs')) {
+        if (!is_executable($eslintPath)) return true;
+    }
+    return false;
+}
+
+/** Find node binary */
+function resolve_node(): ?string {
+    $node = getenv('NODE');
+    if ($node && is_file($node)) return $node;
+    return which('node');
+}
+
+/** Parse CLI args: detect format and output file flags */
+function analyze_args(array $args): array {
+    $hasFormat = false; $format = null;
+    $hasNoColor = false;
+    $outputFile = null;
+
+    for ($i = 0; $i < count($args); $i++) {
+        $a = $args[$i];
+        if ($a === '-f' || $a === '--format') {
+            $hasFormat = true;
+            if (isset($args[$i+1])) $format = $args[$i+1];
+            $i++;
+        } elseif (str_starts_with($a, '-f=')) {
+            $hasFormat = true; $format = substr($a, 3);
+        } elseif (str_starts_with($a, '--format=')) {
+            $hasFormat = true; $format = substr($a, 9);
+        } elseif ($a === '--no-color') {
+            $hasNoColor = true;
+        } elseif ($a === '-o' || $a === '--output-file') {
+            if (isset($args[$i+1])) $outputFile = $args[$i+1];
+            $i++;
+        } elseif (str_starts_with($a, '-o=')) {
+            $outputFile = substr($a, 3);
+        } elseif (str_starts_with($a, '--output-file=')) {
+            $outputFile = substr($a, 14);
+        }
+    }
+    return [$hasFormat, $format, $hasNoColor, $outputFile];
+}
+
+/** Normalize ESLint JSON (array of file results) to a consistent schema. */
+function normalize_eslint_json(array $json): array {
+    // ESLint JSON formatter returns an array of file results.
+    $out = [
+        'totals' => ['errors'=>0, 'warnings'=>0, 'fixableErrors'=>0, 'fixableWarnings'=>0],
+        'files'  => [],   // '/path/file.js' => ['errors'=>int, 'warnings'=>int, 'messages'=>[...]]
+    ];
+    foreach ($json as $fileResult) {
+        if (!isset($fileResult['filePath'])) continue;
+        $fp = (string)$fileResult['filePath'];
+        $errors   = (int)($fileResult['errorCount'] ?? 0);
+        $warnings = (int)($fileResult['warningCount'] ?? 0);
+        $fixE     = (int)($fileResult['fixableErrorCount'] ?? 0);
+        $fixW     = (int)($fileResult['fixableWarningCount'] ?? 0);
+
+        $messages = [];
+        foreach (($fileResult['messages'] ?? []) as $m) {
+            $messages[] = [
+                'ruleId'     => $m['ruleId'] ?? null,
+                'severity'   => (int)($m['severity'] ?? 0), // 1=warn, 2=error
+                'message'    => (string)($m['message'] ?? ''),
+                'line'       => isset($m['line']) ? (int)$m['line'] : null,
+                'column'     => isset($m['column']) ? (int)$m['column'] : null,
+                'endLine'    => isset($m['endLine']) ? (int)$m['endLine'] : null,
+                'endColumn'  => isset($m['endColumn']) ? (int)$m['endColumn'] : null,
+                'suggestions'=> $m['suggestions'] ?? null,
+            ];
+        }
+
+        $out['files'][$fp] = [
+            'errors'   => $errors,
+            'warnings' => $warnings,
+            'fixableErrors'   => $fixE,
+            'fixableWarnings' => $fixW,
+            'messages' => $messages,
+        ];
+
+        $out['totals']['errors']          += $errors;
+        $out['totals']['warnings']        += $warnings;
+        $out['totals']['fixableErrors']   += $fixE;
+        $out['totals']['fixableWarnings'] += $fixW;
+    }
+    return $out;
+}
+
+/** Parse JSON or XML (checkstyle/junit) and normalize. */
+function parse_report(string $payload, ?string $fmtHint): ?array {
+    $hint = $fmtHint ? strtolower($fmtHint) : null;
+    $trim = ltrim($payload);
+
+    // JSON
+    if ($hint === 'json' || ($trim !== '' && ($trim[0] === '[' || $trim[0] === '{'))) {
+        $data = json_decode($payload, true);
+        if (is_array($data)) {
+            // eslint json is usually an array; if object, it may wrap in {"results":[]}
+            if (array_is_list($data)) {
+                return normalize_eslint_json($data);
+            } elseif (isset($data['results']) && is_array($data['results'])) {
+                return normalize_eslint_json($data['results']);
+            }
+        }
+    }
+
+    // XML (checkstyle or junit)
+    if ($hint === 'checkstyle' || $hint === 'junit' || str_starts_with($trim, '<?xml')) {
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($payload);
+        if ($xml !== false) {
+            $root = strtolower($xml->getName());
+            if ($hint === 'checkstyle' || $root === 'checkstyle') return normalize_checkstyle_xml($xml);
+            if ($hint === 'junit' || $root === 'testsuite' || $root === 'testsuites') return normalize_junit_xml($xml);
+        }
+    }
+
+    return null;
+}
+
+/** Normalize Checkstyle XML */
+function normalize_checkstyle_xml(SimpleXMLElement $xml): array {
+    $out = ['totals'=>['errors'=>0,'warnings'=>0,'fixableErrors'=>0,'fixableWarnings'=>0],'files'=>[]];
+    foreach ($xml->file as $file) {
+        $path = (string)$file['name'];
+        $messages = [];
+        $errs = 0; $warns = 0;
+        foreach ($file->error as $e) {
+            $sev = strtolower((string)($e['severity'] ?? 'error'));
+            $isError = $sev !== 'warning';
+            $isError ? $errs++ : $warns++;
+            $messages[] = [
+                'ruleId'   => (string)($e['source'] ?? ''),
+                'severity' => $isError ? 2 : 1,
+                'message'  => (string)($e['message'] ?? ''),
+                'line'     => isset($e['line']) ? (int)$e['line'] : null,
+                'column'   => isset($e['column']) ? (int)$e['column'] : null,
+            ];
+        }
+        $out['files'][$path] = [
+            'errors'=>$errs, 'warnings'=>$warns, 'fixableErrors'=>0, 'fixableWarnings'=>0, 'messages'=>$messages
+        ];
+        $out['totals']['errors'] += $errs;
+        $out['totals']['warnings'] += $warns;
+    }
+    return $out;
+}
+
+/** Normalize JUnit XML (treat <failure> as error) */
+function normalize_junit_xml(SimpleXMLElement $xml): array {
+    $out = ['totals'=>['errors'=>0,'warnings'=>0,'fixableErrors'=>0,'fixableWarnings'=>0],'files'=>[]];
+    $suites = strtolower($xml->getName()) === 'testsuite' ? [$xml] : $xml->testsuite;
+    foreach ($suites as $suite) {
+        foreach ($suite->testcase as $tc) {
+            $file = (string)($tc['file'] ?? '(unknown)');
+            $line = isset($tc['line']) ? (int)$tc['line'] : null;
+            foreach ($tc->failure as $fail) {
+                $msg = (string)$fail;
+                $rule = (string)($fail['type'] ?? '');
+                $out['files'][$file]['messages'][] = [
+                    'ruleId'   => $rule,
+                    'severity' => 2,
+                    'message'  => $msg,
+                    'line'     => $line,
+                    'column'   => null,
+                ];
+                $out['files'][$file]['errors'] = ($out['files'][$file]['errors'] ?? 0) + 1;
+                $out['files'][$file]['warnings'] = ($out['files'][$file]['warnings'] ?? 0);
+                $out['files'][$file]['fixableErrors'] = 0;
+                $out['files'][$file]['fixableWarnings'] = 0;
+                $out['totals']['errors']++;
+            }
+        }
+    }
+    return $out;
+}
+
+/** Your hook: export, gate, or transform the parsed ESLint data. */
+function handle_report(array $report): void {
+    // Example summary to STDERR
+    err(sprintf(
+        "ESLint summary: %d errors, %d warnings (fixable: %d/%d)\n",
+        $report['totals']['errors'],
+        $report['totals']['warnings'],
+        $report['totals']['fixableErrors'],
+        $report['totals']['fixableWarnings']
+    ));
+
+    // Optional CSV export
+    $csv = getenv('ESLINT_CSV');
+    if ($csv) {
+        $fh = fopen($csv, 'w');
+        if ($fh === false) {
+            err("Could not open CSV for writing: {$csv}\n");
+            return;
+        }
+        fputcsv($fh, ['file','line','severity','ruleId','message']);
+        foreach ($report['files'] as $file => $info) {
+            foreach ($info['messages'] as $m) {
+                fputcsv($fh, [
+                    $file,
+                    $m['line'],
+                    $m['severity'],
+                    $m['ruleId'] ?? '',
+                    $m['message'],
+                ]);
+            }
+        }
+        fclose($fh);
+        err("Wrote CSV: {$csv}\n");
+    }
+
+    // Example “manual” gate: stop CI if any errors, but allow warnings
+    // if ($report['totals']['errors'] > 0) exit(1);
+
+    // You can also: generate HTML, post to an API, open an editor, etc.
+}
+
+/* ----------------- main ----------------- */
+
+$script = array_shift($argv);
+$args   = $argv;
+
+$eslint = find_local_eslint(getcwd()) ?? which('eslint');
+if (!$eslint) {
+    err("Error: eslint not found. Install locally (npm i -D eslint) or ensure it's on PATH.\n");
+    exit(127);
+}
+
+[$hasFormat, $format, $hasNoColor, $outputFile] = analyze_args($args);
+
+// If no format chosen, inject json + no-color (best for parsing)
+if (!$hasFormat) {
+    $args[] = '--format';
+    $args[] = 'json';
+    $format = 'json';
+}
+if (!$hasNoColor) {
+    $args[] = '--no-color';
+}
+
+// Build command
+$parts = [];
+if (should_run_via_node($eslint)) {
+    $node = resolve_node();
+    if (!$node) {
+        err("Error: Node.js not found (needed to run eslint script). Set NODE env or install Node.\n");
+        exit(127);
+    }
+    $parts[] = escapeshellarg($node);
+    $parts[] = escapeshellarg($eslint);
+} else {
+    $parts[] = escapeshellarg($eslint);
+}
+foreach ($args as $a) $parts[] = escapeshellarg($a);
+$cmd = implode(' ', $parts);
+
+if (getenv('ESLINT_DEBUG') === '1') {
+    err("Running: {$cmd}\n");
+}
+
+// Capture stdout (report), stream stderr through
+$descriptors = [
+    0 => STDIN,
+    1 => ['pipe', 'w'],
+    2 => STDERR,
+];
+
+$proc = proc_open($cmd, $descriptors, $pipes);
+if (!is_resource($proc)) {
+    err("Error: failed to start eslint.\n");
+    exit(1);
+}
+
+$stdout = stream_get_contents($pipes[1]);
+fclose($pipes[1]);
+$exitCode = proc_close($proc);
+
+// Prefer output-file for parsing if provided
+$payload = '';
+if ($outputFile && is_readable($outputFile)) {
+    $payload = (string)file_get_contents($outputFile);
+} else {
+    $payload = $stdout;
+}
+
+$fmtHint = $format ? strtolower($format) : null;
+$parsed  = parse_report($payload, $fmtHint);
+
+if (is_array($parsed)) {
+    // “Interrupt” default printing; do custom stuff first
+    handle_report($parsed);
+
+    // Optional: also print original stdout after your custom work
+    if (getenv('ESLINT_PASSTHRU') === '1' && $stdout !== '') {
+        fwrite(STDOUT, $stdout);
+    }
+} else {
+    // If we injected JSON but parsing failed, let the raw output through
+    if (!$hasFormat) {
+        err("Note: Expected JSON but could not parse ESLint output. Raw follows:\n");
+    }
+    if ($stdout !== '') fwrite(STDOUT, $stdout);
+}
+
+// Preserve ESLint’s exit code (unless you exit inside handle_report()).
+exit($exitCode);
