@@ -1,0 +1,137 @@
+#!/usr/bin/env php
+<?php
+/**
+ * run-phpcs.php — PHP wrapper that locates phpcs and forwards all args.
+ *
+ * Usage:
+ *   php run-phpcs.php [any phpcs args...]
+ *   ./run-phpcs.php [any phpcs args...]   (if executable)
+ *
+ * Env:
+ *   PHPCS_DEBUG=1   prints the resolved command before execution
+ */
+
+declare(strict_types=1);
+
+function stderr(string $msg): void {
+    fwrite(STDERR, $msg);
+}
+
+function is_windows(): bool {
+    return DIRECTORY_SEPARATOR === '\\';
+}
+
+/**
+ * Search upward from $start for vendor/bin/phpcs or phpcs.phar
+ */
+function find_local_phpcs(string $start): ?string {
+    $dir = realpath($start) ?: $start;
+    while ($dir && $dir !== DIRECTORY_SEPARATOR) {
+        $candidates = [
+            $dir . '/vendor/bin/phpcs',
+            $dir . '/vendor/bin/phpcs.phar',
+        ];
+        foreach ($candidates as $c) {
+            if (file_exists($c)) {
+                return $c;
+            }
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) {
+            break;
+        }
+        $dir = $parent;
+    }
+    return null;
+}
+
+/**
+ * Try to resolve a command from PATH (cross-platform).
+ */
+function which(string $cmd): ?string {
+    // On Windows, respect PATHEXT
+    $paths = array_filter(explode(PATH_SEPARATOR, (string) getenv('PATH')));
+    $exes  = is_windows()
+        ? array_filter(explode(';', (string) getenv('PATHEXT'))) ?: ['.exe', '.bat', '.cmd', '.com']
+        : [''];
+
+    foreach ($paths as $p) {
+        $p = rtrim($p, DIRECTORY_SEPARATOR);
+        foreach ($exes as $ext) {
+            $candidate = $p . DIRECTORY_SEPARATOR . $cmd . $ext;
+            if (is_file($candidate) && is_readable($candidate)) {
+                return $candidate;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Build the command string to run phpcs and forward args.
+ * We prefer running PHP directly for .phar or .php files.
+ */
+function build_phpcs_command(array $argv): array {
+    $script = $argv[0] ?? 'run-phpcs.php';
+    $args   = array_slice($argv, 1);
+
+    $php_bin = PHP_BINARY ?: 'php';
+
+    $phpcs = find_local_phpcs(getcwd());
+
+    if (!$phpcs) {
+        // Try a globally installed "phpcs"
+        $global = which('phpcs');
+        if ($global) {
+            $phpcs = $global;
+        }
+    }
+
+    if (!$phpcs) {
+        stderr("Error: phpcs not found. Install locally with 'composer require --dev squizlabs/php_codesniffer' or ensure 'phpcs' is on your PATH.\n");
+        exit(127);
+    }
+
+    // Decide how to invoke it
+    $lower = strtolower($phpcs);
+    $run_via_php = (str_ends_with($lower, '.phar') || str_ends_with($lower, '.php'));
+
+    // Build a safely-escaped command string
+    $parts = [];
+    if ($run_via_php) {
+        $parts[] = escapeshellarg($php_bin);
+        $parts[] = escapeshellarg($phpcs);
+    } else {
+        $parts[] = escapeshellarg($phpcs);
+    }
+    foreach ($args as $a) {
+        $parts[] = escapeshellarg($a);
+    }
+
+    $cmd = implode(' ', $parts);
+    return [$cmd, $phpcs];
+}
+
+// ---- main ----
+[$cmd, $resolved] = build_phpcs_command($argv);
+
+if (getenv('PHPCS_DEBUG') === '1') {
+    // Show a shell-escaped view of the command
+    fwrite(STDERR, "Running: {$cmd}\n");
+}
+
+// Wire STDIN/OUT/ERR directly so it behaves just like phpcs.
+$descriptorspec = [
+    0 => STDIN,
+    1 => STDOUT,
+    2 => STDERR,
+];
+
+$process = proc_open($cmd, $descriptorspec, $pipes);
+if (!is_resource($process)) {
+    stderr("Error: failed to start phpcs.\n");
+    exit(1);
+}
+
+$status = proc_close($process);
+exit($status);
