@@ -1,0 +1,64 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+// Get hook name from argv, default to 'pre-push'
+$hookName = $argv[1] ?? 'pre-push';
+$hookPath = ".git/hooks/{$hookName}";
+$srcPath  = "./files/{$hookName}";
+$marker   = 'BC Checks before push';
+
+function err($msg) { fwrite(STDERR, $msg . "\n"); }
+function out($msg) { fwrite(STDOUT, $msg . "\n"); }
+
+if (!is_dir('.git/hooks')) {
+  err("Error: .git/hooks directory not found. Are you in a git repo?");
+  exit(1);
+}
+
+if (!file_exists($hookPath)) {
+  if (!copy($srcPath, $hookPath)) {
+    err("Error: Could not copy $srcPath to $hookPath");
+    exit(1);
+  }
+  chmod($hookPath, 0755);
+  out("Installed pre-push hook to $hookPath");
+  exit(0);
+}
+
+// Check if marker is present
+$hookContent = file_get_contents($hookPath);
+if (strpos($hookContent, $marker) !== false) {
+  out("Pre-push hook already contains BC checks.");
+  exit(0);
+}
+
+// Ask user if they want to append
+out("Pre-push hook exists but does not contain BC checks.");
+out("Do you want to append BC checks to your pre-push hook? [y/N]: ");
+$answer = strtolower(trim(fgets(STDIN)));
+if ($answer === 'y') {
+  $srcContent = file_get_contents($srcPath);
+  // Extract only the code after "# Checks code ====="
+  $parts = preg_split('/^# Checks code =====.*$/m', $srcContent);
+  $checksCode = isset($parts[1]) ? ltrim($parts[1]) : '';
+  if ($checksCode === '') {
+    err("No checks code found in $srcPath after marker.");
+    exit(1);
+  }
+  file_put_contents($hookPath, "\n\n" . $checksCode, FILE_APPEND);
+  chmod($hookPath, 0755);
+  out("Appended BC checks to $hookPath");
+} else {
+  $srcContent = file_get_contents($srcPath);
+  $parts = preg_split('/^# Checks code =====.*$/m', $srcContent);
+  $checksCode = isset($parts[1]) ? ltrim($parts[1]) : '';
+  if ($checksCode === '') {
+    err("No checks code found in $srcPath after marker.");
+    exit(1);
+  }
+  out("You can copy/paste the following BC checks code into your hook file:\n");
+  out("----- BEGIN BC CHECKS -----");
+  out($checksCode);
+  out("----- END BC CHECKS -----");
+}

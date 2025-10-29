@@ -26,7 +26,8 @@
     "bin/bc-run-drupal-check",
     "bin/bc-run-js-lint",
     "bin/bc-run-phpcs",
-    "bin/bc-run-phpstan"
+    "bin/bc-run-phpstan",
+    "bc-githook-sync"
   ],
   "config": {
     "sort-packages": true

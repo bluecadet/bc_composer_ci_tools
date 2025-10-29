@@ -1,0 +1,84 @@
+#!/bin/sh
+
+remote="$1"
+url="$2"
+
+
+# Checks code =====
+
+echo ""
+echo "\033[0;32m==== BC Checks before push ====\033[0m"
+echo ""
+
+github_user=$(git config user.name)
+max_exit_code=0
+
+phpcs_output=$(./vendor/bin/bc-run-phpcs -q -s --report=full --standard=Drupal,DrupalPractice --extensions=php,module,inc,install,test,profile,theme,css,info,txt --ignore=node_modules,bower_components,vendor,fractal,dist,fonts --exclude=Drupal.InfoFiles.AutoAddedKeys --colors ./web/modules/custom ./web/themes/custom 2>&1)
+
+exit_code=$?
+if [ $exit_code -eq 127 ]; then
+    echo "\033[0;33mbc-run-phpcs not able to run. Skipping check.\033[0m"
+else
+    if [ $exit_code -gt $max_exit_code ]; then
+        max_exit_code=$exit_code
+    fi
+    if [ $exit_code -ne 0 ]; then
+        echo "\033[1;31mX \033[0;33mphpcs code standards check failed.\033[0m"
+        # exit $exit_code
+    else
+      echo -e "\033[0;32m✔ phpcs code standards check passed.\033[0m"
+    fi
+fi
+
+# PHPStan static analysis
+phpstan_output=$(./vendor/bin/bc-run-phpstan analyse -c phpstan.neon --no-progress 2>&1)
+
+exit_code=$?
+if [ $exit_code -eq 127 ]; then
+  echo "\033[0;33mbc-run-phpstan not able to run. Skipping check.\033[0m"
+else
+  if [ $exit_code -gt $max_exit_code ]; then
+      max_exit_code=$exit_code
+  fi
+  # echo "PHPStan exit code: $exit_code"
+  if [ $exit_code -ne 0 ]; then
+    echo "\033[1;31mX \033[0;33m'PHPStan' static analysis failed.\033[0m"
+    # exit $exit_code
+  else
+    echo -e "\033[0;32m✔ 'PHPStan' static analysis passed.\033[0m"
+  fi
+fi
+
+# Drupal Check static analysis
+drupal_check_output=$(./vendor/bin/bc-run-drupal-check --no-progress --no-interaction ./web/modules/custom ./web/themes/custom 2>&1)
+
+exit_code=$?
+if [ $exit_code -eq 127 ]; then
+  echo "\033[0;33mbc-run-drupal-check not able to run. Skipping check.\033[0m"
+else
+  if [ $exit_code -gt $max_exit_code ]; then
+    max_exit_code=$exit_code
+  fi
+  echo "Drupal Check exit code: $exit_code"
+  if [ $exit_code -ne 0 ]; then
+    echo "\033[1;31mX \033[0;33m'Drupal Check' static analysis failed.\033[0m"
+  else
+    echo -e "\033[0;32m✔ 'Drupal Check' static analysis passed.\033[0m"
+  fi
+fi
+
+# todo - add in js linting.
+
+
+# Final exit code
+if [ $max_exit_code -gt 0 ]; then
+  # echo "\033[0;36mMaximum exit code from checks: $max_exit_code \033[0m"
+  # echo "\033[0;31mAborting push\033[0m"
+  echo ""
+  echo "\033[0;33m   $github_user, please fix the above issues.\033[0m"
+  echo ""
+  echo "\033[0;32m==== END BC Checks before push ====\033[0m"
+  echo ""
+fi
+
+exit 0
