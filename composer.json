@@ -27,7 +27,7 @@
     "bin/bc-run-js-lint",
     "bin/bc-run-phpcs",
     "bin/bc-run-phpstan",
-    "bc-githook-sync"
+    "bin/bc-githook-sync"
   ],
   "config": {
     "sort-packages": true
