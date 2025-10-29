@@ -5,7 +5,7 @@ declare(strict_types=1);
 // Get hook name from argv, default to 'pre-push'
 $hookName = $argv[1] ?? 'pre-push';
 $hookPath = ".git/hooks/{$hookName}";
-$srcPath  = "./vendor/blucadet/bc_composer_ci_tools/files/{$hookName}";
+$srcPath  = "./vendor/bluecadet/bc_composer_ci_tools/files/{$hookName}";
 $marker   = 'BC Checks before push';
 
 function err($msg) { fwrite(STDERR, $msg . "\n"); }
