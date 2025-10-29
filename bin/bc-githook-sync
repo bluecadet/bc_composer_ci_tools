@@ -5,7 +5,7 @@ declare(strict_types=1);
 // Get hook name from argv, default to 'pre-push'
 $hookName = $argv[1] ?? 'pre-push';
 $hookPath = ".git/hooks/{$hookName}";
-$srcPath  = "./files/{$hookName}";
+$srcPath  = "./vendor/blucadet/bc_composer_ci_tools/files/{$hookName}";
 $marker   = 'BC Checks before push';
 
 function err($msg) { fwrite(STDERR, $msg . "\n"); }
@@ -31,6 +31,12 @@ $hookContent = file_get_contents($hookPath);
 if (strpos($hookContent, $marker) !== false) {
   out("Pre-push hook already contains BC checks.");
   exit(0);
+}
+
+
+if (!is_file($srcPath) || !is_readable($srcPath)) {
+  err("Error: Source hook file not found or not readable at $srcPath");
+  exit(1);
 }
 
 // Ask user if they want to append
