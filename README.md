@@ -1,19 +1,23 @@
-# Bluecadet Composer CI Tools
+# Bluecadet PHPCS CI Tools
 
-A set of Composer-installed tools to help automate code quality checks and reporting for PHP projects, especially in CI/CD environments and local development.
+A custom [PHP_CodeSniffer](https://github.com/squizlabs/PHP_CodeSniffer) report formatter plugin designed for GitHub Actions, rendering code-style violations as rich Markdown tables.
 
-## Features
+## Supported PHP Versions
 
-- **PHPCS Markdown Reporting:** Generates Markdown reports from PHPCS output, ideal for use in GitHub Actions.
-- **Git Hook Sync:** Easily install or update git hooks (e.g., `pre-push`, `pre-commit`) to enforce code standards and static analysis before pushing code.
-- **Customizable Checks:** Includes support for PHPCS, PHPStan, and Drupal Check out of the box.
-- **Composer Integration:** Tools are installed via Composer and run from your project's `vendor/bin` directory.
+- PHP 7.4+
+- PHP 8.0+
+- PHP 8.1+
+- PHP 8.2+
+- PHP 8.3+
+
+## Requirements
+
+- **PHP_CodeSniffer 3.x** (`squizlabs/php_codesniffer ^3.0`)
+- Composer for installation
 
 ## Installation
 
-In typical Pantheon Drupal sites this should be included in your upstream.
-
-If you need to manually add, add to your project via Composer:
+Install via Composer as a dev dependency:
 
 ```bash
 composer require --dev bluecadet/bc_composer_ci_tools
@@ -21,50 +25,90 @@ composer require --dev bluecadet/bc_composer_ci_tools
 
 ## Usage
 
-### PHPCS Markdown Report
+### Report Classes
 
-Run PHPCS with the custom wrapper to generate Markdown output:
+This package provides three custom PHPCS report classes under `Bluecadet\PHPCS\Report\`:
 
-```bash
-./vendor/bin/bc-run-phpcs --standard=PSR12 src/
-```
+#### 1. `MarkdownGithub` (Recommended for GitHub Actions)
 
-### Git Hook Sync
-
-Install or update a git hook (defaults to `pre-push`):
+Formats output specifically for GitHub Actions step summaries using KaTeX math syntax for inline colors. Results render beautifully in the PR checks tab.
 
 ```bash
-./vendor/bin/bc-githook-sync
+./vendor/bin/phpcs \
+  --report=Bluecadet\\PHPCS\\Report\\MarkdownGithub \
+  --standard=Drupal \
+  --extensions=php,module,inc,install,test,profile,theme,info,txt \
+  ./web/modules/custom >> $GITHUB_STEP_SUMMARY
 ```
 
-Or specify a different hook:
+**Output includes:**
+
+- Per-file violation tables with color-coded severity levels
+- Summary table of error/warning counts across all files
+- Total violation count
+- Organized details section for easy scanning
+
+#### 2. `Markdown` (Generic Markdown)
+
+Uses inline HTML color spans for generic Markdown renderers that support HTML.
 
 ```bash
-./vendor/bin/bc-githook-sync pre-commit
+./vendor/bin/phpcs \
+  --report=Bluecadet\\PHPCS\\Report\\Markdown \
+  --standard=Drupal \
+  ./web/modules/custom
 ```
 
-This will copy the appropriate hook file from the package, or append the code checks if the hook already exists.
+#### 3. `MarkdownBase` (Base Class)
 
-### Custom Hooks
+Base implementation for custom report extensions. Extend this class to create custom report formats.
 
-You can customize the checks by editing the hook files in `vendor/bluecadet/bc_composer_ci_tools/files/`.
+```php
+use Bluecadet\PHPCS\Report\MarkdownBase;
 
-## Example Checks
+class CustomReport extends MarkdownBase {
+  // Your custom implementation
+}
+```
 
-The default hooks run:
+### Local Usage (Non-GitHub Actions)
 
-- **PHPCS** for code standards
-- **PHPStan** for static analysis
-- **Drupal Check** for Drupal-specific code validation
+For local code style checking:
 
-## Contributing
+```bash
+# Drupal standard check
+./vendor/bin/phpcs --standard=Drupal ./web/modules/custom
 
-Pull requests and issues are welcome! Please open an issue for bugs or feature requests.
+# DrupalPractice standard check
+./vendor/bin/phpcs --standard=DrupalPractice ./web/modules/custom
+
+# With Markdown output
+./vendor/bin/phpcs \
+  --report=Bluecadet\\PHPCS\\Report\\Markdown \
+  --standard=Drupal \
+  ./web/modules/custom
+```
+
+## GitHub Actions Integration
+
+See [`bluecadet/web-gh-actions`](https://github.com/bluecadet/web-gh-actions) for the `ensure-composer-package` action, which manages this package's installation in CI workflows.
+
+Example workflow step:
+
+```yaml
+- name: Run PHPCS with Markdown report
+  run: |
+    ./vendor/bin/phpcs -s \
+      --report=Bluecadet\\PHPCS\\Report\\MarkdownGithub \
+      --standard=Drupal \
+      --extensions=php,module,inc,install,test,profile,theme,info,txt \
+      ./web/modules/custom >> $GITHUB_STEP_SUMMARY
+```
+
+## Authors
+
+- Pete Inge
 
 ## License
 
-MIT
-
----
-
-*Bluecadet Composer CI Tools is maintained by [Bluecadet](https://www.bluecadet.com/).*
+GPL-2.0+
